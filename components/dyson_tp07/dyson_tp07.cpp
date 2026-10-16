@@ -213,119 +213,129 @@ double DysonTP07::get_speed_sensor() {
 
 bool DysonTP07::get_is_on_sensor() { return this->get_speed_sensor() > 0; }
 
+
 void DysonTP07::loop() {
-  static uint8_t buffer[max_line_length] = {};
-  uint8_t data = -1;
-  int buffer_len = 0;
-  while (available()) {
-    this->read_byte(&data);
+  // Never block the ESP8266 event loop for too long.
+  static constexpr size_t MAX_BYTES_PER_LOOP = 96;
+  static constexpr size_t MAX_FRAME_SIZE = 256;
 
-    if (data == START_BYTE) {
-      if (buffer_len > 0) {
-        // receiving START_BYTE again means end of packet
+  // Keep incomplete packets between loop() calls.
+  static uint8_t buffer[MAX_FRAME_SIZE] = {};
+  static size_t buffer_len = 0;
+
+  size_t processed = 0;
+
+  while (processed < MAX_BYTES_PER_LOOP && this->available()) {
+    uint8_t data = 0;
+
+    if (!this->read_byte(&data)) {
+      break;
+    }
+
+    ++processed;
+
+    // Wait for the start delimiter.
+    if (buffer_len == 0) {
+      if (data == START_BYTE) {
         buffer[buffer_len++] = data;
-        break;
       }
-      buffer[buffer_len++] = data;
-    } else {
-      if (buffer_len > 0) {
+      continue;
+    }
+
+    // Reject oversized packets without writing past the buffer.
+    if (buffer_len >= MAX_FRAME_SIZE) {
+      buffer_len = 0;
+
+      if (data == START_BYTE) {
         buffer[buffer_len++] = data;
+      }
+      continue;
+    }
+
+    buffer[buffer_len++] = data;
+
+    // Packet is not complete yet.
+    if (data != START_BYTE) {
+      continue;
+    }
+
+    // We have a complete delimited frame.
+    if (buffer_len >= 2) {
+      uart_packet_t packet = {};
+      packet.packet_size = buffer_len;
+
+      memcpy(packet.ptr, buffer, buffer_len);
+
+      uart_packet_t *unstuffed = this->UnstuffPacket(&packet);
+
+      if (unstuffed != nullptr) {
+        this->ParseDysonPacket(*unstuffed, dyson_reg);
+        free(unstuffed);
       }
     }
+
+    // Start collecting the next packet.
+    buffer_len = 0;
   }
-
-  // Each byte = "FF " + null terminator
-  char buffer_string[max_line_length * 3 + 1];
-  int pos = 0;
-  for (int i = 0; i < buffer_len; i++) {
-    pos += snprintf(&buffer_string[pos], sizeof(buffer_string) - pos, "%02X ",
-                    buffer[i]);
-  }
-
-  if (buffer_len > 1) {
-    ESP_LOGVV(TAG, "Buffer (len %d): %s", buffer_len, buffer_string);
-  } else {
-    return;
-  }
-
-  if (buffer_len > 256) {
-    ESP_LOGE(TAG, "Buffer is longer than 256 (len %d): %s", buffer_len,
-             buffer_string);
-    return;
-  }
-
-  if (buffer[0] != START_BYTE || buffer[buffer_len - 1] != START_BYTE) {
-    ESP_LOGVV(TAG, "Got weird buffer: %s", buffer_string);
-    return;
-  }
-
-  uart_packet_t packet;
-
-  packet.packet_size = buffer_len;
-  memcpy(packet.ptr, buffer, buffer_len);
-
-  uart_packet_t *unstuffed_pack;
-  unstuffed_pack = this->UnstuffPacket(&packet);
-  if (unstuffed_pack) {
-    if (!this->ParseDysonPacket(*unstuffed_pack, dyson_reg)) {
-      ESP_LOGW(TAG, "Parser: Packet format unknown");
-    } else {
-      ESP_LOGVV(TAG, "Successfully parsed packet.");
-    }
-  } else {
-    ESP_LOGVV(TAG, "Pack was not unstuffed.");
-  }
-  free(unstuffed_pack);
 }
+
+
 
 uart_packet_t *DysonTP07::UnstuffPacket(uart_packet_t *pack) {
-  if (pack->packet_size < 2) {
-    ESP_LOGW(TAG, "packet_size was less than 2");
-    return NULL;
+  if (pack == nullptr ||
+      pack->packet_size < 2 ||
+      pack->packet_size > sizeof(pack->ptr)) {
+    return nullptr;
   }
-  if (*pack->ptr != START_BYTE ||
-      *(pack->ptr + pack->packet_size - 1) != START_BYTE) {
-    uint8_t first_byte;
-    uint8_t last_byte;
-    first_byte = *pack->ptr;
-    last_byte = *(pack->ptr + pack->packet_size - 1);
-    ESP_LOGW(
-        TAG,
-        "Didn't get START_BYTE at start and end, got %02X and %02X instead",
-        first_byte, last_byte);
-    return NULL;
+
+  // Verify framing.
+  if (pack->ptr[0] != START_BYTE ||
+      pack->ptr[pack->packet_size - 1] != START_BYTE) {
+    return nullptr;
   }
-  ESP_LOGVV(TAG, "Unstuffing %u bytes, first byte is %u", pack->packet_size,
-            *pack->ptr);
-  uart_packet_t *newPack = (uart_packet_t *)malloc(sizeof(uart_packet_t));
-  if (!newPack) {
-    return NULL;
+
+  uart_packet_t *newPack =
+      (uart_packet_t *) calloc(1, sizeof(uart_packet_t));
+
+  if (newPack == nullptr) {
+    return nullptr;
   }
-  newPack->packet_size = 0;
-  for (int i = 1, j = 0; i < pack->packet_size - 1; i++) {
-    if (pack->ptr[i] == STUFF_BYTE_1) {
-      ESP_LOGVV(TAG, "Got STUFF_BYTE_1");
-      if (pack->ptr[i + 1] == STUFF_BYTE_2) {
-        ESP_LOGVV(TAG, "Got STUFF_BYTE_2");
-        newPack->ptr[j] = START_BYTE;
-      } else if (pack->ptr[i + 1] == STUFF_BYTE_3) {
-        ESP_LOGVV(TAG, "Got STUFF_BYTE_3");
-        newPack->ptr[j] = STUFF_BYTE_1;
+
+  // Remove framing and decode escaped bytes.
+  for (size_t i = 1; i + 1 < pack->packet_size; ++i) {
+    uint8_t value = pack->ptr[i];
+
+    if (value == STUFF_BYTE_1) {
+      // An escape must have another byte before the end delimiter.
+      if (i + 2 >= pack->packet_size) {
+        free(newPack);
+        return nullptr;
       }
-      ++i;
-    } else {
-      newPack->ptr[j] = pack->ptr[i];
+
+      const uint8_t escaped = pack->ptr[++i];
+
+      if (escaped == STUFF_BYTE_2) {
+        value = START_BYTE;
+      } else if (escaped == STUFF_BYTE_3) {
+        value = STUFF_BYTE_1;
+      } else {
+        free(newPack);
+        return nullptr;
+      }
     }
-    ++newPack->packet_size;
-    ++j;
+
+    if (newPack->packet_size >= sizeof(newPack->ptr)) {
+      free(newPack);
+      return nullptr;
+    }
+
+    newPack->ptr[newPack->packet_size++] = value;
   }
+
   newPack->time = pack->time;
-  if (newPack->packet_size > 256) {
-    ESP_LOGE(TAG, "Packet size is too large after unstuffing");
-    return NULL;
-  }
   return newPack;
 }
+
 
 uint8_t DysonTP07::ParseDysonPacket(uart_packet_t &pack, Dyson_regs_t &regs) {
 
