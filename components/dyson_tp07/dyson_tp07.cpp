@@ -359,6 +359,119 @@ uint8_t DysonTP07::ParseDysonPacket(uart_packet_t &pack, Dyson_regs_t &regs) {
     return 1;
   }
 
+  // ==========================================
+  // TP7A STARTUP / STATUS REGISTER DIAGNOSTICS
+  // ==========================================
+
+  // The last 4 bytes are presumed to be CRC.
+  // CRC validation is not implemented yet.
+  constexpr size_t DATA_OFFSET = 16;
+
+  if (pack.packet_size < DATA_OFFSET + 4) {
+    return 1;
+  }
+
+  const size_t body_end = pack.packet_size - 4;
+
+  const uint8_t group = pack.ptr[10];
+  const uint8_t reg_id = pack.ptr[12];
+  const uint8_t value_type = pack.ptr[14];
+  const uint8_t value_count = pack.ptr[15];
+
+  // Validate the encoded data length before
+  // passing the packet to ParseData().
+  size_t item_size = 0;
+
+  switch (value_type) {
+    case 98:  item_size = 1; break;  // uint8
+    case 100: item_size = 2; break;  // uint16
+    case 102: item_size = 4; break;  // uint32
+    case 107: item_size = 8; break;  // double
+    default: return 1;
+  }
+
+  const size_t data_length =
+      static_cast<size_t>(value_count) * item_size;
+
+  if (data_length > body_end - DATA_OFFSET) {
+    return 1;
+  }
+
+  // Keep a small record of previously logged
+  // registers. No dynamic memory allocation.
+  static uint32_t previous_hash[4][32] = {};
+  static uint32_t last_log_time[4][32] = {};
+  static bool seen[4][32] = {};
+
+  const uint8_t group_slot =
+      group == 18 ? 0 : (group < 4 ? group : 0);
+
+  const uint8_t reg_slot =
+      reg_id < 32 ? reg_id : 31;
+
+  // Fingerprint register contents, excluding CRC.
+  uint32_t hash = 2166136261UL;
+
+  for (size_t i = 10; i < body_end; ++i) {
+    hash ^= pack.ptr[i];
+    hash *= 16777619UL;
+  }
+
+  const uint32_t now = millis();
+
+  const bool first_seen =
+      !seen[group_slot][reg_slot];
+
+  const bool changed =
+      hash != previous_hash[group_slot][reg_slot];
+
+  const bool interval_elapsed =
+      (uint32_t)(now -
+        last_log_time[group_slot][reg_slot]) >= 5000;
+
+  if (first_seen || (changed && interval_elapsed)) {
+
+    // Log a maximum of 48 bytes per register.
+    constexpr size_t MAX_PREVIEW = 48;
+    char hex_data[MAX_PREVIEW * 3 + 1] = {};
+
+    const size_t available_bytes = body_end - 10;
+    const size_t preview_length =
+        available_bytes < MAX_PREVIEW
+            ? available_bytes
+            : MAX_PREVIEW;
+
+    for (size_t i = 0; i < preview_length; ++i) {
+      snprintf(
+          &hex_data[i * 3],
+          sizeof(hex_data) - i * 3,
+          "%02X ",
+          pack.ptr[10 + i]
+      );
+    }
+
+    ESP_LOGW(
+        "dyson_tp07.capture",
+        "REG group=%u id=%u type=%u count=%u "
+        "len=%u data=%s%s",
+        (unsigned) group,
+        (unsigned) reg_id,
+        (unsigned) value_type,
+        (unsigned) value_count,
+        (unsigned) available_bytes,
+        hex_data,
+        available_bytes > MAX_PREVIEW ? "..." : ""
+    );
+
+    seen[group_slot][reg_slot] = true;
+    previous_hash[group_slot][reg_slot] = hash;
+    last_log_time[group_slot][reg_slot] = now;
+  }
+
+  // ==========================================
+  // END STATUS REGISTER DIAGNOSTICS
+  // ==========================================
+
   uint8_t regpos = 10;
   uint8_t parseRes = 0;
   const uint8_t *data_pos_ptr = &pack.ptr[regpos + 4];
