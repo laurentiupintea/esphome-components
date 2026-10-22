@@ -355,6 +355,110 @@ uint8_t DysonTP07::ParseDysonPacket(uart_packet_t &pack, Dyson_regs_t &regs) {
                        (pack.ptr[packSize + 1] << 16) |
                        (pack.ptr[packSize] << 8) | (pack.ptr[packSize - 1]);
 
+  // ==============================================
+  // TP7A FAULT INVESTIGATION - READ ONLY
+  // ==============================================
+
+  if (pack.packet_size >= 20 &&
+      pack.packet_size <= sizeof(pack.ptr)) {
+
+    const uint8_t msg_type = pack.ptr[9];
+    const uint8_t group = pack.ptr[10];
+    const uint8_t reg = pack.ptr[12];
+
+    // Select only potentially useful messages.
+    // Ignore the continuously changing uptime register.
+    int slot = -1;
+
+    if (msg_type != 49) {
+      slot = 0;  // Messages ignored by original parser
+    } else if (group == 2) {
+      switch (reg) {
+        case 1:  slot = 1; break;
+        case 2:  slot = 2; break;
+        case 3:  slot = 3; break;
+        case 5:  slot = 4; break;
+        case 12: slot = 5; break;
+      }
+    } else if (group == 3 && reg == 1) {
+      slot = 6;
+    } else if (group == 18 && reg == 5) {
+      slot = 7;
+    }
+
+    if (slot >= 0) {
+
+      static uint32_t previous_hash[8] = {};
+      static uint32_t last_log_ms[8] = {};
+      static bool seen[8] = {};
+
+      // Exclude presumed trailing CRC32.
+      const size_t end = pack.packet_size - 4;
+      const size_t start = msg_type == 49 ? 10 : 3;
+
+      uint32_t hash = 2166136261UL;
+
+      for (size_t i = start; i < end; i++) {
+        hash ^= pack.ptr[i];
+        hash *= 16777619UL;
+      }
+
+      const uint32_t now = millis();
+
+      const bool first = !seen[slot];
+      const bool changed =
+          hash != previous_hash[slot];
+
+      const bool interval_ok =
+          (uint32_t)(now - last_log_ms[slot]) >= 3000;
+
+      if (first || (changed && interval_ok)) {
+
+        // Maximum 48 bytes displayed per packet.
+        // Small fixed buffer to protect ESP8266 RAM.
+        char hex_data[145] = {};
+
+        size_t len = end - start;
+        if (len > 48) {
+          len = 48;
+        }
+
+        for (size_t i = 0; i < len; i++) {
+          snprintf(
+              &hex_data[i * 3],
+              sizeof(hex_data) - i * 3,
+              "%02X ",
+              pack.ptr[start + i]
+          );
+        }
+
+        ESP_LOGW(
+            "dyson_tp07.raw",
+            "TYPE=%u GROUP=%u REG=%u "
+            "LEN=%u DATA=%s "
+            "CRC_BYTES=%02X%02X%02X%02X",
+            (unsigned)msg_type,
+            (unsigned)group,
+            (unsigned)reg,
+            (unsigned)(end - start),
+            hex_data,
+            pack.ptr[pack.packet_size - 4],
+            pack.ptr[pack.packet_size - 3],
+            pack.ptr[pack.packet_size - 2],
+            pack.ptr[pack.packet_size - 1]
+        );
+
+        seen[slot] = true;
+        previous_hash[slot] = hash;
+        last_log_ms[slot] = now;
+      }
+    }
+  }
+
+  // ==============================================
+  // END TP7A DIAGNOSTICS
+  // ==============================================
+
   if (pack.ptr[9] != 49) {
     return 1;
   }
